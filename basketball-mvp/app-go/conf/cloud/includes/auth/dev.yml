@@ -1,0 +1,7 @@
+auth:
+  jwt_secret: please-change-this-secret-in-production
+  issuer: basketball-mvp-cloud
+  access_ttl_second: 7200
+  refresh_ttl_second: 604800
+  default_username: admin
+  default_password: ChangeMe123

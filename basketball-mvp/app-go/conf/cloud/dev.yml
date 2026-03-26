@@ -1,0 +1,11 @@
+app:
+  name: basketball-mvp-cloud
+  env: dev
+  port: 8090
+  mode: release
+  request_timeout_ms: 60000
+
+includes:
+  - includes/logger/dev.yml
+  - includes/mysql/dev.yml
+  - includes/auth/dev.yml

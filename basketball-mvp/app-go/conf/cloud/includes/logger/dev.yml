@@ -1,0 +1,6 @@
+logger:
+  level: info
+  encoding: console
+  file:
+    open: false
+    output_path: ./logs/cloud-api.log
