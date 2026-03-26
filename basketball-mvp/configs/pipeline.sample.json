@@ -1,0 +1,23 @@
+{
+  "pre_seconds": 4.0,
+  "post_seconds": 2.0,
+  "cooldown_sec": 2.0,
+  "hoop": {
+    "cx": 866,
+    "cy": 317,
+    "r": 32
+  },
+  "detect": {
+    "frame_skip": 2,
+    "cooldown_sec": 2.0,
+    "min_ball_area": 30,
+    "max_ball_area": 1400,
+    "min_ball_circularity": 0.45,
+    "track_len": 8,
+    "net_motion_threshold": 0.035,
+    "net_confirm_window_sec": 0.55,
+    "event_merge_window_sec": 1.6,
+    "bg_history": 400,
+    "bg_var_threshold": 48.0
+  }
+}
