@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Basketball MVP - Desktop Flow</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; margin: 20px; color: #111; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+    .panel { border: 1px solid #ddd; border-radius: 8px; padding: 12px; margin-bottom: 14px; }
+    .muted { color: #666; font-size: 13px; }
+    button { padding: 8px 12px; border-radius: 6px; border: 1px solid #999; background: #f7f7f7; cursor: pointer; }
+    button.primary { background: #1f6feb; color: white; border-color: #1f6feb; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    select { padding: 7px; min-width: 380px; border: 1px solid #bbb; border-radius: 6px; }
+    #videoWrap { position: relative; width: min(900px, 100%); }
+    #preview { width: 100%; display: block; background: #000; }
+    #previewCandidateFrame { position: absolute; left: 0; top: 0; width: 100%; height: 100%; object-fit: contain; background: #000; display: none; pointer-events: none; z-index: 1; }
+    #overlay { position: absolute; left: 0; top: 0; width: 100%; height: 100%; cursor: crosshair; z-index: 2; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ddd; padding: 6px; text-align: left; vertical-align: middle; }
+    .ok { color: #188038; }
+    .err { color: #b3261e; }
+    .thumb { width: 120px; height: 68px; object-fit: cover; background: #f0f0f0; border: 1px solid #ddd; }
+    .timeline { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 8px; }
+    .timeline button { white-space: nowrap; padding: 6px 10px; }
+    .time-btn { border: 1px solid #666; background: #fff; }
+  </style>
+</head>
+<body>
+  <h2>篮球视频自动剪辑（单任务桌面 MVP）</h2>
+
+  <div class="panel">
+    <div class="row">
+      <strong>任务向导</strong>
+    </div>
+    <div class="row">
+      <button id="btnChooseVideo" class="primary">选择本地视频</button>
+      <span id="videoPathText" class="muted"></span>
+      <span id="videoInfo" class="muted"></span>
+    </div>
+    <div id="videoWrap" class="row" style="display:none;">
+      <video id="preview" controls></video>
+      <img id="previewCandidateFrame" alt="候选篮框检测帧（主预览）" />
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="row">
+      <span id="hoopInfo" class="muted">等待选择视频后自动检测篮框</span>
+    </div>
+    <div class="row" id="manualHoopRow" style="display:none;">
+      <button id="btnPickHoop">手动画框（中心 -> 边缘）</button>
+      <span id="manualHoopInfo" class="muted"></span>
+    </div>
+    <div class="row" id="hoopCandidateRow" style="display:none;">
+      <select id="hoopCandidateSelect"></select>
+      <button id="btnConfirmHoopCandidate" class="primary">确认篮框</button>
+      <span id="hoopCandidateInfo" class="muted"></span>
+    </div>
+    <div class="row">
+      <button id="btnStart" class="primary" disabled>开始剪辑任务</button>
+      <span id="jobInfo" class="muted"></span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="row"><strong>任务状态</strong><span id="statusText" class="muted">未开始</span></div>
+    <div class="row muted"><span id="progressText">进度: 0%</span><span id="etaText">预计剩余: -</span><span id="elapsedText">已耗时: -</span></div>
+    <div class="row">
+      <button id="btnTerminateJob" disabled>终止任务</button>
+      <button id="btnClearPreviewCache">清理预览缓存</button>
+      <span id="jobActionInfo" class="muted"></span>
+    </div>
+    <div class="row muted"><span id="resultPath"></span></div>
+  </div>
+
+  <div class="panel">
+    <div class="row"><strong>进球时间轴预览（点击跳转）</strong><span id="eventStats" class="muted">已选 0 / 共 0</span></div>
+    <div id="timeline" class="timeline"></div>
+    <div class="row">
+      <button id="btnSelectAll">全选</button>
+      <button id="btnSelectNone">全不选</button>
+      <button id="btnExportSelected" class="primary" disabled>导出视频</button>
+      <span id="editInfo" class="muted"></span>
+    </div>
+    <table>
+      <thead><tr><th>导出</th><th>#</th><th>time_sec</th><th>截图</th><th>reason</th></tr></thead>
+      <tbody id="eventsBody"></tbody>
+    </table>
+  </div>
+
+<script>
+// 页面运行时状态。
+// 约定:
+//  - 当前任务相关字段统一放这里，避免散落全局变量。
+//  - `events[].enabled !== false` 视为“勾选导出”。
+const state = {
+  videoPath: '',
+  currentJobId: '',
+  currentJobStatus: '',
+  pollTimer: null,
+  events: [],
+  hoop: null,
+  hoopCandidates: [],
+  hoopPreviewImage: '',
+  pendingHoop: null,
+  pickMode: false,
+  center: null,
+  naturalW: 0,
+  naturalH: 0,
+  dialogBusy: false,
+  autoDetecting: false,
+};
+
+const $ = (id) => document.getElementById(id);
+const q = (s) => encodeURIComponent(s || '');
+
+/**
+ * 设置文本与样式类。
+ * @param {string} id - 目标元素 ID。
+ * @param {string} text - 要显示的文本。
+ * @param {string} [cls='muted'] - CSS class 名。
+ */
+function setText(id, text, cls='muted') {
+  const el = $(id);
+  el.textContent = text;
+  el.className = cls;
+}
+
+/**
+ * 刷新“开始任务”按钮可点击状态。
+ */
+function refreshStartButtonState() {
+  const canStart = !!state.videoPath && !!state.hoop;
+  $('btnStart').disabled = !canStart;
+}
+
+/**
+ * 更新任务控制按钮状态。
+ */
+function refreshJobActionButtons() {
+  const running = !!state.currentJobId && state.currentJobStatus === 'running';
+  $('btnTerminateJob').disabled = !running;
+}
+
+/**
+ * 控制“手工兜底画框”入口显隐。
+ * @param {boolean} visible - 是否显示。
+ * @param {string} [text=''] - 说明文案。
+ * @param {string} [cls='muted'] - 文案样式。
+ */
+function setManualHoopFallback(visible, text='', cls='muted') {
+  $('manualHoopRow').style.display = visible ? 'flex' : 'none';
+  setText('manualHoopInfo', text, cls);
+}
+
+/**
+ * 清空当前篮框候选与已确认结果（用于切换视频或重新检测）。
+ */
+function resetHoopSelectionState() {
+  state.hoop = null;
+  state.pendingHoop = null;
+  state.hoopCandidates = [];
+  state.hoopPreviewImage = '';
+  setVideoCandidateSnapshot('');
+  const row = $('hoopCandidateRow');
+  row.style.display = 'none';
+  $('hoopCandidateSelect').innerHTML = '';
+  setText('hoopCandidateInfo', '');
+  setManualHoopFallback(false, '');
+  setText('hoopInfo', '等待选择视频后自动检测篮框', 'muted');
+  refreshStartButtonState();
+  refreshJobActionButtons();
+  renderOverlay();
+}
+
+/**
+ * 将某个篮框写入“已确认”状态。
+ * @param {{cx:number,cy:number,r:number}} hoop - 篮框参数。
+ * @param {string} source - 来源描述。
+ */
+function applyConfirmedHoop(hoop, source) {
+  if (!hoop || !Number(hoop.r)) return;
+  state.hoop = {
+    cx: Math.round(Number(hoop.cx)),
+    cy: Math.round(Number(hoop.cy)),
+    r: Math.max(10, Math.round(Number(hoop.r))),
+  };
+  state.pendingHoop = null;
+  setVideoCandidateSnapshot('');
+  setManualHoopFallback(false, '');
+  setText('hoopInfo', `已确认篮框(${source}): cx=${state.hoop.cx}, cy=${state.hoop.cy}, r=${state.hoop.r}`, 'ok');
+  setText('hoopCandidateInfo', '篮框已确认，可直接开始任务', 'ok');
+  refreshStartButtonState();
+  renderOverlay();
+}
+
+/**
+ * 渲染候选选择 UI（用于 single/multiple）。
+ */
+function renderHoopCandidates() {
+  const row = $('hoopCandidateRow');
+  const sel = $('hoopCandidateSelect');
+  if (!Array.isArray(state.hoopCandidates) || state.hoopCandidates.length === 0) {
+    row.style.display = 'none';
+    sel.innerHTML = '';
+    setVideoCandidateSnapshot('');
+    return;
+  }
+  sel.innerHTML = '';
+  state.hoopCandidates.forEach((cand, idx) => {
+    const opt = document.createElement('option');
+    opt.value = String(cand.id || String(idx));
+    opt.textContent = `候选${idx + 1}: cx=${cand.cx}, cy=${cand.cy}, r=${cand.r}, score=${Number(cand.score || 0).toFixed(3)}`;
+    sel.appendChild(opt);
+  });
+  row.style.display = 'flex';
+  sel.value = String(state.hoopCandidates[0].id || '0');
+  state.pendingHoop = { ...state.hoopCandidates[0] };
+  renderSelectedHoopCandidatePreview(state.hoopCandidates[0], 0);
+  setText('hoopCandidateInfo', '请选择候选并确认', 'muted');
+  renderOverlay();
+}
+
+/**
+ * 在主视频预览区域显示/隐藏候选检测帧截图。
+ * @param {string} absPath - 候选帧截图绝对路径；为空则恢复视频预览。
+ */
+function setVideoCandidateSnapshot(absPath) {
+  const path = String(absPath || '').trim();
+  const img = $('previewCandidateFrame');
+  const overlay = $('overlay');
+  const video = $('preview');
+  if (path) {
+    video.pause();
+    img.src = `${fileUrl(path)}&t=${Date.now()}`;
+    img.style.display = 'block';
+    overlay.style.display = 'none';
+    return;
+  }
+  img.removeAttribute('src');
+  img.style.display = 'none';
+  overlay.style.display = 'block';
+}
+
+/**
+ * 展示当前选中候选的“检测帧截图+圈框”。
+ * @param {{id?:string,cx:number,cy:number,r:number,score?:number,count?:number,frame?:number,frame_image?:string}} cand - 候选篮框。
+ * @param {number} idx - 候选序号（从 0 开始）。
+ */
+function renderSelectedHoopCandidatePreview(cand, idx) {
+  if (!cand) {
+    setVideoCandidateSnapshot('');
+    return;
+  }
+  const frameImage = String(cand.frame_image || state.hoopPreviewImage || '').trim();
+  if (frameImage) {
+    setVideoCandidateSnapshot(frameImage);
+  } else {
+    setVideoCandidateSnapshot('');
+  }
+}
+
+/**
+ * 自动检测篮框候选。
+ */
+async function runAutoDetectHoop() {
+  if (!state.videoPath) return setText('hoopInfo', '请先选择视频', 'err');
+  if (state.autoDetecting) return;
+  state.autoDetecting = true;
+  setVideoCandidateSnapshot('');
+  setText('hoopInfo', '正在自动检测篮框...', 'muted');
+  setManualHoopFallback(false, '');
+  try {
+    const resp = await fetch('/api/v1/hoop/detect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ video_path: state.videoPath }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      setVideoCandidateSnapshot('');
+      setText('hoopInfo', data.error || '自动检测失败，请手动画框', 'err');
+      setText('hoopCandidateInfo', '自动检测失败，进入手工兜底流程', 'muted');
+      setManualHoopFallback(true, '未检测到可用篮框，请点击按钮进行手工选择篮筐位置', 'ok');
+      return;
+    }
+
+    state.hoop = null;
+    state.pendingHoop = null;
+    state.hoopPreviewImage = String(data.preview_image || '').trim();
+    state.hoopCandidates = Array.isArray(data.candidates) ? data.candidates : [];
+    const status = data.status || (state.hoopCandidates.length === 0 ? 'none' : (state.hoopCandidates.length === 1 ? 'single' : 'multiple'));
+
+    if (status === 'none' || state.hoopCandidates.length === 0) {
+      setVideoCandidateSnapshot('');
+      $('hoopCandidateRow').style.display = 'none';
+      setText('hoopInfo', '未检测到篮框，请手动画框', 'err');
+      setText('hoopCandidateInfo', '未检测到候选，进入手工兜底流程', 'muted');
+      setManualHoopFallback(true, '未检测到可用篮框，请点击按钮进行手动选择篮框位置', 'ok');
+      renderOverlay();
+      refreshStartButtonState();
+      return;
+    }
+
+    setManualHoopFallback(false, '');
+    renderHoopCandidates();
+    if (status === 'single' || state.hoopCandidates.length === 1) {
+      setText('hoopInfo', '检测到 1 个篮框，请确认', 'ok');
+    } else {
+      setText('hoopInfo', `检测到 ${state.hoopCandidates.length} 个篮框，请选择一个`, 'ok');
+    }
+    refreshStartButtonState();
+  } catch (err) {
+    setVideoCandidateSnapshot('');
+    setText('hoopInfo', `自动检测失败: ${err?.message || String(err)}`, 'err');
+    setText('hoopCandidateInfo', '自动检测失败，使用手动画框兜底', 'err');
+    setManualHoopFallback(true, '自动检测失败，请点击按钮进行手动选择篮筐区域', 'ok');
+  } finally {
+    state.autoDetecting = false;
+  }
+}
+
+/**
+ * 秒数转 mm:ss。
+ * @param {number} sec - 秒数。
+ * @returns {string} 格式化后的时间字符串。
+ */
+function secToClock(sec) {
+  const s = Math.max(0, Math.floor(sec));
+  const mm = String(Math.floor(s / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return `${mm}:${ss}`;
+}
+
+/**
+ * 本地绝对路径转后端可访问 URL。
+ * @param {string} absPath - 本地绝对路径。
+ * @returns {string} 文件访问地址。
+ */
+function fileUrl(absPath) {
+  if (!absPath) return '';
+  return `/api/v1/file?path=${q(absPath)}`;
+}
+
+/**
+ * 让后端准备可播放预览（必要时自动转码并缓存）。
+ * @param {string} absPath - 原始视频绝对路径。
+ * @returns {Promise<{preview_path:string,cache_reused:boolean}>}
+ */
+async function prepareVideoPreview(absPath) {
+  const resp = await fetch(`/api/v1/video/prepare-preview?path=${q(absPath)}`);
+  let data = {};
+  try { data = await resp.json(); } catch (_) {}
+  if (!resp.ok) {
+    throw new Error(data.error || '视频预览准备失败');
+  }
+  return data;
+}
+
+/**
+ * 控制“打开系统对话框”按钮忙碌态。
+ * @param {boolean} busy - 是否忙碌。
+ */
+function setDialogButtonsBusy(busy) {
+  $('btnChooseVideo').disabled = busy;
+}
+
+/**
+ * 打开原生文件/目录选择框。
+ *
+ * 优先调用桌面壳注入的 JS Bridge；若不存在则回退到 HTTP 接口。
+ *
+ * @param {string} endpoint - 回退接口地址。
+ * @param {string} infoId - 状态文案元素 ID。
+ * @param {string} openingText - 打开中提示。
+ * @param {string} failText - 失败提示前缀。
+ * @returns {Promise<object|null>} 选择结果；失败返回 null。
+ */
+async function openNativeDialog(endpoint, infoId, openingText, failText) {
+  if (state.dialogBusy) {
+    setText(infoId, '对话框正在打开，请先完成当前选择', 'muted');
+    return null;
+  }
+  state.dialogBusy = true;
+  setDialogButtonsBusy(true);
+  setText(infoId, openingText, 'muted');
+  let timer = null;
+  try {
+    const desktopBridgeName = endpoint.includes('/open-video') ? 'desktopOpenVideoDialog' : 'desktopOpenDirectoryDialog';
+    const desktopBridge = window[desktopBridgeName];
+    if (typeof desktopBridge === 'function') {
+      const data = await desktopBridge();
+      if (!data || data.error) {
+        setText(infoId, (data && data.error) || failText, 'err');
+        return null;
+      }
+      return data;
+    }
+
+    const controller = new AbortController();
+    timer = setTimeout(() => controller.abort(), 15000);
+    const resp = await fetch(endpoint, { method: 'POST', signal: controller.signal });
+    let data = {};
+    try { data = await resp.json(); } catch (_) {}
+    if (!resp.ok) {
+      setText(infoId, data.error || failText, 'err');
+      return null;
+    }
+    return data;
+  } catch (err) {
+    const msg = (err && err.name === 'AbortError')
+      ? '对话框响应超时（15s），请重试或重启应用'
+      : ((err && err.message) ? err.message : String(err));
+    setText(infoId, `${failText}: ${msg}`, 'err');
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+    state.dialogBusy = false;
+    setDialogButtonsBusy(false);
+  }
+}
+
+/**
+ * 重绘视频覆盖层（篮框圆、框选中间点）。
+ */
+function renderOverlay() {
+  const video = $('preview');
+  const canvas = $('overlay');
+  if (!video.videoWidth || !video.videoHeight) return;
+  canvas.width = video.clientWidth;
+  canvas.height = video.clientHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+
+  const drawCircle = (cx, cy, r, color) => {
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.stroke();
+  };
+
+  if (state.hoop) {
+    const sx = canvas.width / state.naturalW;
+    const sy = canvas.height / state.naturalH;
+    drawCircle(state.hoop.cx * sx, state.hoop.cy * sy, state.hoop.r * ((sx + sy) / 2), '#00ff99');
+  }
+  if (state.pendingHoop && !state.hoop) {
+    const sx = canvas.width / state.naturalW;
+    const sy = canvas.height / state.naturalH;
+    drawCircle(state.pendingHoop.cx * sx, state.pendingHoop.cy * sy, state.pendingHoop.r * ((sx + sy) / 2), '#ffd200');
+  }
+  if (state.center) drawCircle(state.center.x, state.center.y, 4, '#ff6600');
+}
+
+/**
+ * 把 overlay 像素点坐标转换为视频原始分辨率坐标。
+ * @param {number} px - overlay x。
+ * @param {number} py - overlay y。
+ * @returns {{x:number,y:number}} 原视频坐标。
+ */
+function videoPointToNatural(px, py) {
+  const canvas = $('overlay');
+  const sx = state.naturalW / canvas.width;
+  const sy = state.naturalH / canvas.height;
+  return { x: Math.round(px * sx), y: Math.round(py * sy) };
+}
+
+/**
+ * 跳转到指定秒数并尝试播放。
+ * @param {number} sec - 目标秒数。
+ */
+function jumpTo(sec) {
+  const video = $('preview');
+  if (!video.src) return;
+  video.currentTime = Math.max(0, Number(sec) || 0);
+  video.play().catch(() => {});
+}
+
+/**
+ * 更新“已选/总数”统计与导出按钮可用性。
+ */
+function updateSelectionStats() {
+  const total = state.events.length;
+  const selected = state.events.filter(e => e.enabled !== false).length;
+  setText('eventStats', `已选 ${selected} / 共 ${total}`);
+  $('btnExportSelected').disabled = selected === 0 || !state.currentJobId;
+}
+
+/**
+ * 渲染时间轴按钮。
+ */
+function renderTimeline() {
+  const box = $('timeline');
+  box.innerHTML = '';
+  state.events.forEach((ev, i) => {
+    const b = document.createElement('button');
+    b.className = 'time-btn';
+    b.textContent = `${i + 1}. ${secToClock(ev.time_sec)}`;
+    if (ev.enabled === false) b.style.opacity = '0.45';
+    b.onclick = () => jumpTo(ev.time_sec);
+    box.appendChild(b);
+  });
+}
+
+/**
+ * 渲染事件表格。
+ */
+function renderEvents() {
+  const body = $('eventsBody');
+  body.innerHTML = '';
+  state.events.forEach((ev, i) => {
+    const tr = document.createElement('tr');
+    const checked = ev.enabled === false ? '' : 'checked';
+    const imgUrl = fileUrl(ev.frame_image || '');
+    tr.innerHTML = `
+      <td><input type="checkbox" data-i="${i}" class="enable-input" ${checked}></td>
+      <td>${i + 1}</td>
+      <td><button class="time-btn jump-btn" data-i="${i}">${Number(ev.time_sec).toFixed(2)}s (${secToClock(ev.time_sec)})</button></td>
+      <td>${ev.frame_image ? `<img class="thumb" src="${imgUrl}" alt="goal_${i+1}">` : '<span class="muted">无截图</span>'}</td>
+      <td>${ev.reason || '-'}</td>
+    `;
+    body.appendChild(tr);
+  });
+  updateSelectionStats();
+  renderTimeline();
+}
+
+/**
+ * 新任务启动前清空上一轮事件和轮询状态。
+ */
+function clearPreviousRunEvents() {
+  if (state.pollTimer) {
+    clearInterval(state.pollTimer);
+    state.pollTimer = null;
+  }
+  state.currentJobId = '';
+  state.currentJobStatus = '';
+  state.events = [];
+  renderEvents();
+  setText('editInfo', '');
+  setText('jobActionInfo', '');
+  refreshJobActionButtons();
+}
+
+/**
+ * 用服务端最新事件覆盖本地事件，并尽量保留用户勾选状态。
+ * @param {Array<object>} serverEvents - 服务端返回的事件数组。
+ */
+function mergeEventsFromServer(serverEvents) {
+  const prevMap = new Map();
+  state.events.forEach((e) => {
+    const k = `${Number(e.time_sec).toFixed(2)}|${e.reason || ''}`;
+    prevMap.set(k, e.enabled !== false);
+  });
+  state.events = serverEvents.map((e) => {
+    const key = `${Number(e.time_sec || 0).toFixed(2)}|${e.reason || ''}`;
+    const prevEnabled = prevMap.has(key) ? prevMap.get(key) : true;
+    return {
+      time_sec: Number(e.time_sec || 0),
+      reason: e.reason || 'auto_detect',
+      confidence: Number(e.confidence || 1),
+      frame_image: e.frame_image || '',
+      enabled: prevEnabled,
+    };
+  });
+}
+
+// 选择本地视频（系统对话框）
+$('btnChooseVideo').onclick = async () => {
+  const data = await openNativeDialog('/api/v1/dialog/open-video', 'videoInfo', '正在打开视频选择框...', '选择视频失败');
+  if (!data) return;
+  await applyVideoPath(data.video_path);
+};
+
+/**
+ * 应用视频路径并初始化预览组件。
+ * @param {string} path - 本地视频绝对路径。
+ */
+async function applyVideoPath(path) {
+  if (!path) return;
+  state.videoPath = path.trim();
+  resetHoopSelectionState();
+  state.pickMode = false;
+  state.center = null;
+  setText('videoPathText', `已选择: ${state.videoPath}`, 'muted');
+  setText('videoInfo', '正在加载原视频（若失败将自动转码预览）...', 'muted');
+
+  const video = $('preview');
+  setVideoCandidateSnapshot('');
+  let fallbackTried = false;
+  video.src = fileUrl(state.videoPath);
+  $('videoWrap').style.display = 'block';
+  video.onloadedmetadata = () => {
+    state.naturalW = video.videoWidth;
+    state.naturalH = video.videoHeight;
+    if (fallbackTried) {
+      setText('videoInfo', '视频已加载（预览代理）', 'ok');
+    } else {
+      setText('videoInfo', '视频已加载（原始视频）', 'ok');
+    }
+    renderOverlay();
+    refreshStartButtonState();
+    refreshJobActionButtons();
+    runAutoDetectHoop();
+  };
+  video.onerror = async () => {
+    if (!fallbackTried) {
+      fallbackTried = true;
+      setText('videoInfo', '原视频无法播放，正在生成预览代理...', 'muted');
+      try {
+        const prep = await prepareVideoPreview(state.videoPath);
+        const previewPath = prep.preview_path || state.videoPath;
+        if (prep.cache_reused) {
+          setText('videoInfo', '视频已加载（命中预览缓存）', 'ok');
+        }
+        video.src = fileUrl(previewPath);
+        return;
+      } catch (err) {
+        setText('videoInfo', `预览代理生成失败: ${(err && err.message) ? err.message : String(err)}`, 'err');
+        refreshStartButtonState();
+        refreshJobActionButtons();
+        return;
+      }
+    }
+    setText('videoInfo', '视频预览失败：文件可能损坏，或系统无法解码。建议重新选择视频。', 'err');
+  };
+  refreshStartButtonState();
+  refreshJobActionButtons();
+}
+
+// 进入篮框框选模式
+$('btnPickHoop').onclick = () => {
+  if (!state.videoPath) return setText('hoopInfo', '请先选择视频', 'err');
+  setVideoCandidateSnapshot('');
+  $('hoopCandidateRow').style.display = 'none';
+  setText('hoopCandidateInfo', '已切换到手动画框兜底流程', 'muted');
+  state.pickMode = true;
+  state.center = null;
+  state.hoop = null;
+  state.pendingHoop = null;
+  refreshStartButtonState();
+  renderOverlay();
+  setText('hoopInfo', '未检测到可用篮框或需要人工修正：请点击中心，再点击边缘', 'ok');
+};
+
+// 处理 overlay 点击：第一次记录中心点，第二次计算半径并完成 hoop 标定。
+$('overlay').addEventListener('click', (e) => {
+  if (!state.pickMode) return;
+  const rect = e.target.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+  if (!state.center) {
+    state.center = { x, y };
+    renderOverlay();
+    return;
+  }
+
+  const dx = x - state.center.x;
+  const dy = y - state.center.y;
+  const rScreen = Math.max(8, Math.round(Math.sqrt(dx * dx + dy * dy)));
+  const cN = videoPointToNatural(state.center.x, state.center.y);
+  const eN = videoPointToNatural(state.center.x + rScreen, state.center.y);
+  const rN = Math.max(10, Math.abs(eN.x - cN.x));
+
+  state.pickMode = false;
+  state.center = null;
+  applyConfirmedHoop({ cx: cN.x, cy: cN.y, r: rN }, '手工');
+});
+
+// 候选切换：切换预览圈，不立即回填，需用户点击确认。
+$('hoopCandidateSelect').addEventListener('change', (e) => {
+  const id = String(e.target.value || '');
+  const idx = state.hoopCandidates.findIndex((x, i) => String(x.id || String(i)) === id);
+  const chosen = idx >= 0 ? state.hoopCandidates[idx] : null;
+  if (!chosen) return;
+  state.pendingHoop = { ...chosen };
+  renderSelectedHoopCandidatePreview(chosen, Math.max(0, idx));
+  setText('hoopCandidateInfo', `已选择候选：cx=${chosen.cx}, cy=${chosen.cy}, r=${chosen.r}，点击“确认篮框”生效`, 'muted');
+  renderOverlay();
+});
+
+// 用户确认候选后回填。
+$('btnConfirmHoopCandidate').onclick = () => {
+  const pending = state.pendingHoop || (state.hoopCandidates.length ? state.hoopCandidates[0] : null);
+  if (!pending) {
+    setText('hoopCandidateInfo', '当前没有可确认的候选，请手动画框', 'err');
+    return;
+  }
+  applyConfirmedHoop(pending, '自动检测');
+};
+
+// 启动剪辑任务
+$('btnStart').onclick = async () => {
+  if (!state.videoPath) return setText('jobInfo', '请先选择视频', 'err');
+  if (!state.hoop) return setText('jobInfo', '请先完成篮框（自动确认或手工兜底）', 'err');
+  clearPreviousRunEvents();
+  setText('jobInfo', '任务创建中...');
+  setText('jobActionInfo', '');
+  const payload = {
+    video_path: state.videoPath,
+    hoop: state.hoop,
+  };
+  const resp = await fetch('/api/v1/single-job/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await resp.json();
+  if (!resp.ok) return setText('jobInfo', data.error || '任务创建失败', 'err');
+  state.currentJobId = data.job_id;
+  state.currentJobStatus = 'running';
+  refreshJobActionButtons();
+  setText('jobInfo', `任务已启动: ${state.currentJobId}`, 'ok');
+  startPolling();
+};
+
+// 勾选框变更后同步到 state.events
+$('eventsBody').addEventListener('change', (e) => {
+  const t = e.target;
+  if (!t.classList.contains('enable-input')) return;
+  const i = Number(t.dataset.i);
+  state.events[i].enabled = t.checked;
+  updateSelectionStats();
+  renderTimeline();
+});
+
+// 点击时间按钮跳转预览视频
+$('eventsBody').addEventListener('click', (e) => {
+  const btn = e.target.closest('.jump-btn');
+  if (!btn) return;
+  const i = Number(btn.dataset.i);
+  jumpTo(state.events[i].time_sec);
+});
+
+// 批量全选/全不选
+$('btnSelectAll').onclick = () => { state.events.forEach(e => e.enabled = true); renderEvents(); };
+$('btnSelectNone').onclick = () => { state.events.forEach(e => e.enabled = false); renderEvents(); };
+
+// 导出当前勾选事件（先保存事件，再触发 reexport）
+$('btnExportSelected').onclick = async () => {
+  if (!state.currentJobId) return;
+  const selected = state.events.filter(e => e.enabled !== false);
+  if (selected.length === 0) return setText('editInfo', '请至少选择一个事件', 'err');
+
+  const events = selected.map((e) => ({ time_sec: Number(e.time_sec), confidence: Number(e.confidence || 1), reason: e.reason || 'manual_keep' }));
+  setText('editInfo', '正在保存勾选事件...');
+  const saveResp = await fetch(`/api/v1/jobs/${state.currentJobId}/events`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ events }),
+  });
+  const saveData = await saveResp.json();
+  if (!saveResp.ok) return setText('editInfo', saveData.error || '保存失败', 'err');
+
+  setText('editInfo', '正在导出视频...');
+  const reResp = await fetch(`/api/v1/jobs/${state.currentJobId}/reexport`, { method: 'POST' });
+  const reData = await reResp.json();
+  if (!reResp.ok) return setText('editInfo', reData.error || '重导出失败', 'err');
+
+  setText('editInfo', `已启动导出（${selected.length}个事件）`, 'ok');
+  startPolling();
+};
+
+/**
+ * 轮询任务状态并刷新 UI。
+ * @returns {Promise<void>}
+ */
+async function pollJob() {
+  if (!state.currentJobId) return;
+  const resp = await fetch(`/api/v1/jobs/${state.currentJobId}`);
+  const data = await resp.json();
+  if (!resp.ok) return;
+
+  state.currentJobStatus = data.status || '';
+  refreshJobActionButtons();
+  setText('statusText', `status=${data.status}, stage=${data.progress?.stage || '-'} ${Math.round(data.progress?.percent || 0)}%`, data.status === 'failed' ? 'err' : 'ok');
+  $('progressText').textContent = `进度: ${Math.round(data.progress?.percent || 0)}%`;
+  $('etaText').textContent = `预计剩余: ${Math.round(data.progress?.estimated_left_sec || 0)}s`;
+  $('elapsedText').textContent = `已耗时: ${Math.round(data.progress?.elapsed_sec || 0)}s`;
+  $('resultPath').textContent = data.highlight_path ? `导出视频：${data.highlight_path}` : '';
+  if (data.status === 'failed') {
+    setText('jobInfo', `任务失败：${data.error || '未知错误'}`, 'err');
+  }
+  if (data.status === 'done') {
+    if (data.highlight_path) {
+      setText('jobInfo', `导出成功：${data.highlight_path}`, 'ok');
+      setText('editInfo', `导出成功：${data.highlight_path}`, 'ok');
+    } else {
+      setText('jobInfo', '任务完成，可勾选事件再次导出', 'ok');
+    }
+  }
+
+  if (Array.isArray(data.events)) {
+    mergeEventsFromServer(data.events);
+    renderEvents();
+  }
+  if (data.status === 'failed' || data.status === 'done') {
+    if (state.pollTimer) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+    refreshJobActionButtons();
+  }
+}
+
+/**
+ * 启动状态轮询（1.5s 一次）。
+ */
+function startPolling() {
+  if (state.pollTimer) clearInterval(state.pollTimer);
+  pollJob();
+  state.pollTimer = setInterval(pollJob, 1500);
+}
+
+// 终止任务
+$('btnTerminateJob').onclick = async () => {
+  if (!state.currentJobId) return setText('jobActionInfo', '当前没有可终止的任务', 'muted');
+  setText('jobActionInfo', '正在请求终止任务...', 'muted');
+  try {
+    const resp = await fetch(`/api/v1/jobs/${state.currentJobId}/terminate`, { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) return setText('jobActionInfo', data.error || '终止任务失败', 'err');
+    setText('jobActionInfo', '已请求终止任务，稍后会停止', 'ok');
+  } catch (err) {
+    setText('jobActionInfo', `终止任务失败: ${err?.message || String(err)}`, 'err');
+  }
+};
+
+// 清理预览缓存
+$('btnClearPreviewCache').onclick = async () => {
+  setText('jobActionInfo', '正在清理预览缓存...', 'muted');
+  try {
+    const resp = await fetch('/api/v1/video/clear-preview-cache', { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) return setText('jobActionInfo', data.error || '清理缓存失败', 'err');
+    setText('jobActionInfo', '预览缓存已清理', 'ok');
+  } catch (err) {
+    setText('jobActionInfo', `清理缓存失败: ${err?.message || String(err)}`, 'err');
+  }
+};
+</script>
+</body>
+</html>
