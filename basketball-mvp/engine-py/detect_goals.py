@@ -106,6 +106,23 @@ class AutoHoopConfig:
     sample_ratios: List[float] = field(default_factory=lambda: [0.15, 0.35, 0.5, 0.65, 0.85])
 
 
+@dataclass
+class BallDetectorConfig:
+    """YOLO 球检测参数（ONNX 单类球检测）。"""
+
+    enabled: bool = False
+    model_path: str = ""
+    # ONNX 导出时固定为 640 输入，推理需与之一致（cv2.dnn 无法改 imgsz）。
+    input_size: int = 640
+    conf_threshold: float = 0.15
+    iou_threshold: float = 0.45
+    # 球是小目标：面积占比下限极小，上限用于抑制大块误检。
+    min_box_area_ratio: float = 0.000005
+    max_box_area_ratio: float = 0.05
+    # 是否在 YOLO 未检出时回退到 MOG2 背景差分找球。
+    fallback_to_mog2: bool = True
+
+
 def parse_manual_goals(raw: str) -> List[float]:
     """解析手工时间点字符串。
 
@@ -190,6 +207,23 @@ def load_auto_hoop_config(cfg: Dict) -> AutoHoopConfig:
     return c
 
 
+def load_ball_detector_config(cfg: Dict) -> BallDetectorConfig:
+    """从整份配置中提取 `ball_detector` 参数。"""
+    raw = cfg.get("ball_detector", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    c = BallDetectorConfig()
+    c.enabled = bool(raw.get("enabled", c.enabled))
+    c.model_path = str(raw.get("model_path", c.model_path)).strip()
+    c.input_size = max(64, int(raw.get("input_size", c.input_size)))
+    c.conf_threshold = float(raw.get("conf_threshold", c.conf_threshold))
+    c.iou_threshold = float(raw.get("iou_threshold", c.iou_threshold))
+    c.min_box_area_ratio = float(raw.get("min_box_area_ratio", c.min_box_area_ratio))
+    c.max_box_area_ratio = float(raw.get("max_box_area_ratio", c.max_box_area_ratio))
+    c.fallback_to_mog2 = bool(raw.get("fallback_to_mog2", c.fallback_to_mog2))
+    return c
+
+
 def _is_valid_hoop(cfg: Dict, width: int, height: int) -> bool:
     """检查 hoop(cx,cy,r) 是否基本有效。"""
     hoop = cfg.get("hoop", {})
@@ -248,6 +282,127 @@ def _resolve_auto_hoop_model_path(model_path: str, config_path: str) -> Optional
         if path.is_file():
             return path
     return _discover_default_auto_hoop_model()
+
+
+def _discover_default_ball_model() -> Optional[Path]:
+    """尝试发现默认球检测 ONNX 模型（latest best.onnx）。"""
+    roots: List[Path] = []
+    env_root = os.environ.get("BASKETBALL_MVP_ROOT", "").strip()
+    if env_root:
+        roots.append(Path(env_root))
+    roots.append(Path(__file__).resolve().parents[1])
+
+    candidates: List[Path] = []
+    seen = set()
+    for root in roots:
+        resolved = root.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+
+        embedded = resolved / "models" / "ball" / "best.onnx"
+        if embedded.is_file():
+            candidates.append(embedded)
+
+        run_dir = resolved / "training" / "ball_detector" / "runs"
+        if not run_dir.exists():
+            continue
+        candidates.extend(run_dir.glob("*/weights/best.onnx"))
+    candidates = [p for p in candidates if p.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _resolve_ball_model_path(model_path: str, config_path: str) -> Optional[Path]:
+    """解析 ball_detector 模型路径。"""
+    if model_path:
+        path = Path(model_path)
+        if not path.is_absolute() and config_path:
+            path = (Path(config_path).resolve().parent / path).resolve()
+        elif not path.is_absolute():
+            path = path.resolve()
+        if path.is_file():
+            return path
+    return _discover_default_ball_model()
+
+
+def _infer_ball_box_with_onnx(frame, net, cfg: BallDetectorConfig):
+    """在单帧上执行 ONNX 球检测，返回最像球的目标中心与置信度。
+
+    Args:
+        frame: BGR 原图。
+        net: 已加载的 `cv2.dnn.Net`。
+        cfg: 球检测参数。
+
+    Returns:
+        `None` 表示未检出；否则返回 `((gx, gy), conf)`：
+        `(gx, gy)` 为原图坐标下的球中心，`conf` 为检测置信度。
+    """
+    src_h, src_w = frame.shape[:2]
+    lb, scale, pad_x, pad_y = _letterbox_frame(frame, cfg.input_size)
+    blob = cv2.dnn.blobFromImage(lb, 1.0 / 255.0, (cfg.input_size, cfg.input_size), swapRB=True, crop=False)
+    net.setInput(blob)
+    pred = net.forward()
+
+    arr = np.array(pred)
+    if arr.ndim == 3:
+        arr = arr[0]
+    if arr.ndim != 2:
+        return None
+    # YOLOv8 ONNX 常见输出：(C, N)，转为 (N, C) 统一处理。
+    if arr.shape[0] <= 10 and arr.shape[1] > arr.shape[0]:
+        arr = arr.T
+    if arr.shape[1] < 5:
+        return None
+
+    boxes_xywh: List[List[float]] = []
+    scores: List[float] = []
+    raw_rows: List[Tuple[float, float, float, float, float]] = []
+    for row in arr:
+        x, y, w, h = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+        if w <= 1e-4 or h <= 1e-4:
+            continue
+        if len(row) == 5:
+            score = float(row[4])
+        else:
+            obj = float(row[4])
+            cls_score = float(np.max(row[5:])) if len(row) > 5 else 1.0
+            score = obj * cls_score
+        if score < cfg.conf_threshold:
+            continue
+        x1 = x - w * 0.5
+        y1 = y - h * 0.5
+        boxes_xywh.append([x1, y1, w, h])
+        scores.append(score)
+        raw_rows.append((x1, y1, w, h, score))
+
+    if not boxes_xywh:
+        return None
+
+    keep = cv2.dnn.NMSBoxes(boxes_xywh, scores, cfg.conf_threshold, cfg.iou_threshold)
+    if keep is None or len(keep) == 0:
+        return None
+
+    frame_area = float(max(1, src_w * src_h))
+    best: Optional[Tuple[Tuple[int, int], float]] = None
+    for idx_raw in keep:
+        idx = int(idx_raw[0]) if isinstance(idx_raw, (list, tuple, np.ndarray)) else int(idx_raw)
+        x1, y1, w, h, score = raw_rows[idx]
+        ox1 = max(0.0, min(float(src_w - 1), (x1 - pad_x) / scale))
+        oy1 = max(0.0, min(float(src_h - 1), (y1 - pad_y) / scale))
+        ox2 = max(0.0, min(float(src_w - 1), (x1 + w - pad_x) / scale))
+        oy2 = max(0.0, min(float(src_h - 1), (y1 + h - pad_y) / scale))
+        bw = max(1.0, ox2 - ox1)
+        bh = max(1.0, oy2 - oy1)
+        area_ratio = (bw * bh) / frame_area
+        if area_ratio < cfg.min_box_area_ratio or area_ratio > cfg.max_box_area_ratio:
+            continue
+        gx = int(round((ox1 + ox2) * 0.5))
+        gy = int(round((oy1 + oy2) * 0.5))
+        if best is None or score > best[1]:
+            best = ((gx, gy), float(score))
+    return best
 
 
 def _letterbox_frame(frame, input_size: int):
@@ -822,6 +977,89 @@ def detect_hoop_candidates(
         "frame_size": {"width": width, "height": height},
         "candidates": candidates_out,
         "preview_image": preview_path,
+        "debug_json": str(debug_json),
+    }
+
+
+def detect_ball_candidates(
+    video_path: str,
+    cfg_raw: Dict,
+    config_path: str,
+    debug_dir: Path,
+    sample_count: int = 24,
+) -> Dict:
+    """只执行球检测（用于调试与回归对比）。
+
+    Args:
+        video_path: 输入视频路径。
+        cfg_raw: 完整配置字典（读取 `ball_detector` 段）。
+        config_path: 当前任务配置文件路径（用于解析相对模型路径）。
+        debug_dir: 调试产物目录。
+        sample_count: 均匀采样的帧数。
+
+    Returns:
+        汇总字典，包含逐帧检测结果与 `detection_ratio`（采到球的帧占比）。
+    """
+    require_cv_deps()
+    ball_cfg = load_ball_detector_config(cfg_raw)
+    model_path = _resolve_ball_model_path(ball_cfg.model_path, config_path)
+    if model_path is None:
+        raise RuntimeError(
+            "ball model not found. export best.onnx and ensure it is bundled under models/ball/best.onnx "
+            "or placed under training/ball_detector/runs/*/weights/"
+        )
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"failed to open video: {video_path}")
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    net = cv2.dnn.readNetFromONNX(str(model_path))
+    step = max(1, total_frames // max(1, sample_count)) if total_frames > 0 else 1
+    sampled_frames = list(range(0, max(1, total_frames), step))
+
+    rows: List[Dict] = []
+    hits = 0
+    for frame_idx in sampled_frames:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            rows.append({"frame": frame_idx, "ok": False, "detected": False})
+            continue
+        result = _infer_ball_box_with_onnx(frame, net, ball_cfg)
+        row = {"frame": frame_idx, "ok": True, "detected": result is not None}
+        if result is not None:
+            (gx, gy), conf = result
+            row["center"] = {"x": int(gx), "y": int(gy)}
+            row["conf"] = round(float(conf), 4)
+            hits += 1
+        rows.append(row)
+    cap.release()
+
+    sampled = sum(1 for r in rows if r.get("ok"))
+    ratio = (hits / sampled) if sampled else 0.0
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    debug_payload = {
+        "video": video_path,
+        "model_path": str(model_path),
+        "input_size": ball_cfg.input_size,
+        "conf_threshold": ball_cfg.conf_threshold,
+        "frame_size": {"width": width, "height": height},
+        "sample_count": len(sampled_frames),
+        "detected_frames": hits,
+        "detection_ratio": round(float(ratio), 4),
+        "frames": rows,
+    }
+    debug_json = debug_dir / "ball_detect_debug.json"
+    debug_json.write_text(json.dumps(debug_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {
+        "model_path": str(model_path),
+        "frame_size": {"width": width, "height": height},
+        "sample_count": len(sampled_frames),
+        "detected_frames": hits,
+        "detection_ratio": round(float(ratio), 4),
         "debug_json": str(debug_json),
     }
 
@@ -1435,6 +1673,32 @@ def detect_goals_auto(
         hoop_region.y2 + net_downward_extra,
     ).clip(width, height)
 
+    # 球检测：优先使用 YOLO ONNX（鲁棒于手持/移动机位），未配置时回退 MOG2。
+    ball_cfg = load_ball_detector_config(cfg_raw)
+    ball_net = None
+    ball_det_meta = {"enabled": ball_cfg.enabled, "status": "disabled"}
+    if ball_cfg.enabled:
+        try:
+            ball_model = _resolve_ball_model_path(ball_cfg.model_path, config_path)
+            if ball_model is None:
+                raise RuntimeError("ball_detector enabled but model not found under training/ball_detector/runs/*/weights/ or models/ball/best.onnx")
+            ball_net = cv2.dnn.readNetFromONNX(str(ball_model))
+            ball_det_meta = {
+                "enabled": True,
+                "status": "ok",
+                "model_path": str(ball_model),
+                "input_size": ball_cfg.input_size,
+                "conf_threshold": ball_cfg.conf_threshold,
+                "fallback_to_mog2": ball_cfg.fallback_to_mog2,
+            }
+        except Exception as e:  # noqa: BLE001 - 模型加载失败不应阻断主流程
+            ball_det_meta = {
+                "enabled": True,
+                "status": "error",
+                "error": str(e),
+                "fallback_to_mog2": ball_cfg.fallback_to_mog2,
+            }
+
     bg = cv2.createBackgroundSubtractorMOG2(history=cfg.bg_history, varThreshold=cfg.bg_var_threshold, detectShadows=False)
     prev_net_gray: Optional[np.ndarray] = None
     track: List[Tuple[int, int, float]] = []
@@ -1466,20 +1730,36 @@ def detect_goals_auto(
             cooldown -= 1
 
         ball_center: Optional[Tuple[int, int]] = None
+        ball_conf: float = 0.0
         in_above = False
         in_hoop = False
         above_recently = False
         moving_down = False
 
-        det_roi = crop(frame, detect_region)
-        # 运动前景提取 + 轮廓过滤，定位当前帧最像“球”的目标中心。
-        fg = bg.apply(det_roi)
-        _, fg = cv2.threshold(fg, 220, 255, cv2.THRESH_BINARY)
-        center_local = find_ball_center(fg, cfg)
+        # 球定位：YOLO ONNX 优先（全图、返回全局坐标），未检出或未启用时回退 MOG2。
+        yolo_result: Optional[Tuple[Tuple[int, int], float]] = None
+        if ball_net is not None:
+            yolo_result = _infer_ball_box_with_onnx(frame, ball_net, ball_cfg)
 
-        if center_local is not None:
-            gx = center_local[0] + detect_region.x1
-            gy = center_local[1] + detect_region.y1
+        gx: Optional[int] = None
+        gy: Optional[int] = None
+        if yolo_result is not None:
+            (gx, gy), ball_conf = yolo_result
+        elif ball_net is not None and not ball_cfg.fallback_to_mog2:
+            pass  # YOLO 启用但未检出且禁止回退，本帧跳过。
+        else:
+            # MOG2 兜底：仅对 detect_region 做背景差分 + 轮廓过滤。
+            det_roi = crop(frame, detect_region)
+            fg = bg.apply(det_roi)
+            _, fg = cv2.threshold(fg, 220, 255, cv2.THRESH_BINARY)
+            center_local = find_ball_center(fg, cfg)
+            if center_local is not None:
+                gx = center_local[0] + detect_region.x1
+                gy = center_local[1] + detect_region.y1
+                # MOG2 无置信度概念，沿用历史常量，保持固定机位路径评分不变。
+                ball_conf = 0.65
+
+        if gx is not None and gy is not None:
             ball_center = (gx, gy)
             track.append((gx, gy, frame_idx / fps))
             if len(track) > cfg.track_len:
@@ -1501,14 +1781,14 @@ def detect_goals_auto(
                     candidates.append({
                         "frame": frame_idx,
                         "time_sec": frame_idx / fps,
-                        "ball_conf": 0.65,
+                        "ball_conf": ball_conf,
                     })
                     lite_debug.add_candidate(
                         frame_idx=frame_idx,
                         time_sec=frame_idx / fps,
                         moving_down=moving_down,
                         above_recently=above_recently,
-                        ball_conf=0.65,
+                        ball_conf=ball_conf,
                     )
                     cooldown = cooldown_frames
                     track.clear()
@@ -1665,6 +1945,7 @@ def detect_goals_auto(
             "lite_debug_dir": lite_debug_dir,
         },
         "auto_hoop": auto_hoop_meta,
+        "ball_detector": ball_det_meta,
         "hoop": cfg_raw.get("hoop", {}),
     }
     return dedup, meta
@@ -1687,6 +1968,8 @@ def main():
     parser.add_argument("--lite-debug-frame-step", type=int, default=12, help="save one debug frame/metric every N processed frames")
     parser.add_argument("--lite-debug-max-frames", type=int, default=120, help="max debug frame images to save")
     parser.add_argument("--detect-hoop-only", action="store_true", help="only detect hoop candidates and skip goal detection")
+    parser.add_argument("--ball-detect-only", action="store_true", help="only run YOLO ball detection on sampled frames (debug)")
+    parser.add_argument("--ball-detect-samples", type=int, default=24, help="sampled frame count for --ball-detect-only")
     args = parser.parse_args()
 
     cfg_raw = load_json(args.config)
@@ -1712,6 +1995,23 @@ def main():
             "config": args.config,
             "mode": "hoop_only",
             "hoop_detection": hoop_detection,
+        }
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return
+
+    if args.ball_detect_only:
+        ball_detection = detect_ball_candidates(
+            video_path=args.video,
+            cfg_raw=cfg_raw,
+            config_path=args.config,
+            debug_dir=debug_dir,
+            sample_count=max(2, int(args.ball_detect_samples)),
+        )
+        payload = {
+            "video": args.video,
+            "config": args.config,
+            "mode": "ball_detect_only",
+            "ball_detection": ball_detection,
         }
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         return

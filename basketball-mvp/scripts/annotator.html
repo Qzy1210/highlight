@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>进球真值标注</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #14171c; color: #e6e9ee; height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 10px 16px; background: #1b1f27; border-bottom: 1px solid #2a3038;
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  select, button {
+    font: inherit; color: inherit; background: #232a34; border: 1px solid #333c48;
+    border-radius: 6px; padding: 6px 10px; cursor: pointer;
+  }
+  button.primary { background: #2563eb; border-color: #2563eb; }
+  button.primary:hover { background: #1d4ed8; }
+  button.danger { background: #7f1d1d; border-color: #7f1d1d; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  main { flex: 1; display: flex; min-height: 0; }
+  .left { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .video-wrap { flex: 1; background: #000; display: flex; align-items: center; justify-content: center; min-height: 0; }
+  video { max-width: 100%; max-height: 100%; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  .bar { padding: 10px 16px; background: #1b1f27; border-top: 1px solid #2a3038; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .time { font-variant-numeric: tabular-nums; font-size: 16px; min-width: 120px; }
+  .hint { color: #8b95a3; }
+  .right {
+    width: 360px; min-width: 300px; border-left: 1px solid #2a3038; background: #1b1f27;
+    display: flex; flex-direction: column; min-height: 0;
+  }
+  .right h2 { font-size: 13px; margin: 0; padding: 12px 16px; border-bottom: 1px solid #2a3038; color: #aab3c0; font-weight: 600; }
+  #events { flex: 1; overflow-y: auto; padding: 8px; margin: 0; list-style: none; }
+  #events li {
+    display: flex; align-items: center; gap: 8px; padding: 8px 10px; margin-bottom: 6px;
+    background: #232a34; border-radius: 6px; border: 1px solid #2f3742;
+  }
+  #events li .t { font-variant-numeric: tabular-nums; font-weight: 600; color: #7dd3fc; }
+  #events li .note { flex: 1; color: #c8d0da; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #events li button { padding: 2px 8px; font-size: 12px; }
+  .right .foot { padding: 12px 16px; border-top: 1px solid #2a3038; display: flex; gap: 8px; }
+  .right .foot button { flex: 1; }
+  .status { font-size: 12px; color: #8b95a3; padding: 0 16px 10px; min-height: 18px; }
+  .empty { color: #667; text-align: center; padding: 24px 8px; font-size: 13px; }
+  kbd { background: #2a3038; border: 1px solid #3a434f; border-bottom-width: 2px; border-radius: 4px; padding: 1px 6px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>进球真值标注</h1>
+  <select id="videoSelect"></select>
+  <button id="prevBtn" title="上一条">◀ 上一条</button>
+  <button id="nextBtn" title="下一条">下一条 ▶</button>
+  <span class="hint">空格=播放/暂停 &nbsp;·&nbsp; <kbd>M</kbd>=在当前位置打点 &nbsp;·&nbsp; ←/→=±1s&nbsp;·&nbsp;J/L=±5s</span>
+</header>
+
+<main>
+  <div class="left">
+    <div class="video-wrap">
+      <video id="video" controls preload="metadata"></video>
+    </div>
+    <div class="bar">
+      <span class="time" id="timeLabel">0.000s / 0.000s</span>
+      <button id="markBtn" class="primary">打点 (M)</button>
+      <button id="back1">« 1s</button>
+      <button id="back5">« 5s</button>
+      <button id="fwd1">1s »</button>
+      <button id="fwd5">5s »</button>
+      <span class="hint" id="speedHint"></span>
+    </div>
+  </div>
+
+  <aside class="right">
+    <h2>已标注事件 (<span id="count">0</span>)</h2>
+    <ul id="events"></ul>
+    <div class="status" id="status"></div>
+    <div class="foot">
+      <button id="saveBtn" class="primary">保存</button>
+      <button id="clearBtn" class="danger">清空</button>
+    </div>
+  </aside>
+</main>
+
+<script>
+(() => {
+  const videoSelect = document.getElementById('videoSelect');
+  const video = document.getElementById('video');
+  const timeLabel = document.getElementById('timeLabel');
+  const eventsUl = document.getElementById('events');
+  const countEl = document.getElementById('count');
+  const statusEl = document.getElementById('status');
+  const markBtn = document.getElementById('markBtn');
+  const saveBtn = document.getElementById('saveBtn');
+  const clearBtn = document.getElementById('clearBtn');
+
+  let videos = [];
+  let current = '';
+  let events = [];          // [{time_sec, note}]
+  let dirty = false;
+
+  const fmt = (t) => (Number.isFinite(t) ? t.toFixed(3) : '0.000');
+
+  function setStatus(msg, ok = true) {
+    statusEl.textContent = msg;
+    statusEl.style.color = ok ? '#8b95a3' : '#f87171';
+  }
+
+  function renderEvents() {
+    countEl.textContent = String(events.length);
+    eventsUl.innerHTML = '';
+    if (!events.length) {
+      const li = document.createElement('li');
+      li.className = 'empty';
+      li.textContent = '还没有打点。播放到进球时刻，按 M 或点“打点”。';
+      eventsUl.appendChild(li);
+      return;
+    }
+    events.forEach((ev, i) => {
+      const li = document.createElement('li');
+      const t = document.createElement('span');
+      t.className = 't';
+      t.textContent = fmt(ev.time_sec) + 's';
+      const note = document.createElement('span');
+      note.className = 'note';
+      note.textContent = ev.note || '';
+      const goBtn = document.createElement('button');
+      goBtn.textContent = '跳转';
+      goBtn.onclick = () => { video.currentTime = ev.time_sec; video.focus(); };
+      const delBtn = document.createElement('button');
+      delBtn.textContent = '删除';
+      delBtn.onclick = () => { events.splice(i, 1); dirty = true; renderEvents(); };
+      li.appendChild(t); li.appendChild(note); li.appendChild(goBtn); li.appendChild(delBtn);
+      eventsUl.appendChild(li);
+    });
+  }
+
+  function addMark() {
+    if (!current) return;
+    const t = video.currentTime;
+    const rounded = Math.round(t * 1000) / 1000;
+    // 同一时刻(±0.2s)去重，避免连按重复。
+    if (events.some((e) => Math.abs(e.time_sec - rounded) < 0.2)) {
+      setStatus('该时刻附近已有点，已忽略。');
+      return;
+    }
+    events.push({ time_sec: rounded, note: '' });
+    events.sort((a, b) => a.time_sec - b.time_sec);
+    dirty = true;
+    renderEvents();
+    setStatus(`已打点 @ ${fmt(rounded)}s`);
+  }
+
+  async function loadTruth(name) {
+    try {
+      const r = await fetch('/api/truth/' + encodeURIComponent(name));
+      const data = await r.json();
+      events = Array.isArray(data.events)
+        ? data.events.map((e) => ({ time_sec: Number(e.time_sec) || 0, note: e.note || '' }))
+        : [];
+    } catch (e) {
+      events = [];
+      setStatus('读取真值失败: ' + e.message, false);
+    }
+    dirty = false;
+    renderEvents();
+  }
+
+  async function selectVideo(name) {
+    if (!name) return;
+    if (dirty && !confirm('当前视频有未保存的标注，切换将丢失。继续？')) {
+      videoSelect.value = current;   // 回滚选择
+      return;
+    }
+    current = name;
+    videoSelect.value = name;
+    video.src = '/video/' + encodeURIComponent(name);
+    video.load();
+    await loadTruth(name);
+    setStatus('已加载 ' + name);
+    video.focus();
+  }
+
+  async function save() {
+    if (!current) return;
+    saveBtn.disabled = true;
+    try {
+      const payload = { events, duration_sec: Number.isFinite(video.duration) ? video.duration : null };
+      const r = await fetch('/api/truth/' + encodeURIComponent(current), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+      dirty = false;
+      setStatus(`已保存 ${data.count} 个事件 -> ${data.saved}`);
+    } catch (e) {
+      setStatus('保存失败: ' + e.message, false);
+    } finally {
+      saveBtn.disabled = false;
+    }
+  }
+
+  function step(delta) {
+    if (!Number.isFinite(video.duration)) return;
+    video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + delta));
+  }
+
+  // ---- events ----
+  video.addEventListener('timeupdate', () => {
+    timeLabel.textContent = `${fmt(video.currentTime)}s / ${fmt(video.duration)}s`;
+  });
+  video.addEventListener('loadedmetadata', () => {
+    timeLabel.textContent = `${fmt(video.currentTime)}s / ${fmt(video.duration)}s`;
+  });
+
+  markBtn.onclick = addMark;
+  saveBtn.onclick = save;
+  clearBtn.onclick = () => {
+    if (!events.length) return;
+    if (confirm('清空当前视频的全部标注（需再点保存才生效）？')) {
+      events = []; dirty = true; renderEvents(); setStatus('已清空，记得保存。');
+    }
+  };
+  document.getElementById('back1').onclick = () => step(-1);
+  document.getElementById('back5').onclick = () => step(-5);
+  document.getElementById('fwd1').onclick = () => step(1);
+  document.getElementById('fwd5').onclick = () => step(5);
+  document.getElementById('prevBtn').onclick = () => {
+    const i = videos.indexOf(current);
+    if (i > 0) selectVideo(videos[i - 1]);
+  };
+  document.getElementById('nextBtn').onclick = () => {
+    const i = videos.indexOf(current);
+    if (i >= 0 && i < videos.length - 1) selectVideo(videos[i + 1]);
+  };
+  videoSelect.onchange = () => selectVideo(videoSelect.value);
+
+  document.addEventListener('keydown', (e) => {
+    const tag = (e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+    if (e.code === 'Space') {
+      e.preventDefault();
+      video.paused ? video.play() : video.pause();
+    } else if (e.key === 'm' || e.key === 'M') {
+      e.preventDefault();
+      addMark();
+    } else if (e.key === 'ArrowLeft') {
+      e.preventDefault(); step(e.shiftKey ? -5 : -1);
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault(); step(e.shiftKey ? 5 : 1);
+    } else if (e.key === 'j' || e.key === 'J') {
+      e.preventDefault(); step(-5);
+    } else if (e.key === 'l' || e.key === 'L') {
+      e.preventDefault(); step(5);
+    }
+  });
+
+  window.addEventListener('beforeunload', (e) => {
+    if (dirty) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  // ---- init ----
+  (async () => {
+    try {
+      const r = await fetch('/api/videos');
+      const data = await r.json();
+      videos = data.videos || [];
+    } catch (e) {
+      setStatus('获取视频列表失败: ' + e.message, false);
+      return;
+    }
+    if (!videos.length) {
+      setStatus('视频目录为空。', false);
+      return;
+    }
+    videos.forEach((name) => {
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name;
+      videoSelect.appendChild(opt);
+    });
+    await selectVideo(videos[0]);
+  })();
+})();
+</script>
+</body>
+</html>

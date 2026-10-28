@@ -15,6 +15,14 @@
     "iou_threshold": 0.45,
     "fallback_to_manual": true
   },
+  "ball_detector": {
+    "enabled": false,
+    "model_path": "",
+    "input_size": 640,
+    "conf_threshold": 0.15,
+    "iou_threshold": 0.45,
+    "fallback_to_mog2": true
+  },
   "detect": {
     "frame_skip": 2,
     "cooldown_sec": 2.0,

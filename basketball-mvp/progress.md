@@ -1,5 +1,72 @@
 # Progress Log
 
+## Session: 2026-09-23（P0：YOLO 球检测接入 detect_goals 主链路）
+
+### Phase P0: YOLO 球检测优先 + MOG2 兜底
+- **Status:** complete
+- Actions taken:
+  - 新增 `BallDetectorConfig`（model_path/input_size=640/conf/iou/area 上下限/fallback_to_mog2）。
+  - 新增 `load_ball_detector_config`、`_discover_default_ball_model`、`_resolve_ball_model_path`、
+    `_infer_ball_box_with_onnx`（复用 hoop 的 letterbox + cv2.dnn 自做 NMS 范式，返回球中心+置信度）。
+  - `detect_goals_auto` 主循环改为「YOLO ONNX 球检测优先 → MOG2 兜底」：
+    - YOLO 全图检测直接返回全局坐标（对手持/移动机位鲁棒）；
+    - MOG2 路径仅在 detect_region 内做背景差分（保留固定机位能力），并沿用历史 `ball_conf=0.65` 常量；
+    - 候选事件的 `ball_conf` 不再写死，YOLO 命中时透传真实置信度。
+  - 新增 `--ball-detect-only` + `--ball-detect-samples` 调试模式（均匀采样求检测命中率）。
+  - `configs/pipeline.sample.json` 增加 `ball_detector` 配置段（默认 `enabled:false`，不影响旧行为）。
+- 验证：
+  - `python3 -m py_compile detect_goals.py` 通过。
+  - `cd app-go && go build ./...` 通过（仅第三方 sqweek/dialog deprecation 告警）。
+  - ONNX 自动发现并推理：
+    - IMG_3(1080p) detected 16/40 => 40.0%
+    - 582055(720p竖) 8/42 => 19.1%
+    - 371be0(720p横) 13/42 => 31.0%
+  - 全链路回归（`detect_goals_auto`，582055 / IMG_3）：
+    - `ball_detector.enabled=false` 与 `=true` 均正常出 events/meta；
+    - 582055 events 2 → 3（YOLO 优先后多捕获 1 个候选）；
+    - IMG_3 两模式均为 0 events（该视频目视无明显进球）。
+  - 加载失败安全兜底：`enabled:true` 但模型缺失时 `ball_det_meta.status=error`，不阻断主流程。
+- 产物：
+  - `engine-py/detect_goals.py`（BallDetectorConfig / 推理 / 主循环集成 / CLI）
+  - `configs/pipeline.sample.json`（ball_detector 段）
+
+## Session: 2026-09-23（球检测微调基线）
+
+### Phase 1: 公开数据集下载与整理
+- **Status:** complete
+- Actions taken:
+  - 弃用坏数据集 `emirsahin/basketball-ball`（224MB zip 含 0 个标签文件）。
+  - 采用 `koppolusameer/basketball-coco-player-detection`（CC BY 4.0，COCO 标注）。
+  - `snapshot_download(max_workers=16)` 下载 2446 文件到 `/tmp/bball_ds/dl/...`。
+  - 新增 `scripts/convert_ball_coco_to_yolo.py`，抽取 `category_id==1`(ball) 转 YOLO。
+- 产物：
+  - `training/ball_detector/datasets/ball_v1/`（train 1943 / valid 166 / test 151）。
+  - `training/ball_detector/dataset.yaml`。
+
+### Phase 2: 训练球检测基线
+- **Status:** complete
+- Actions taken:
+  - 新增 `scripts/train_ball_detector.sh`、`scripts/export_ball_onnx.sh`。
+  - YOLOv8n 微调：`imgsz=640 batch=16 device=mps epochs=100(patience=30)`。
+  - 89 epoch 早停，最佳 epoch 59，耗时 2.81h。
+- 指标：
+  - test 划分（ultralytics val）：P=0.948 R=0.815 mAP50=0.905 mAP50-95=0.538。
+  - 与 COCO 零样本同条件对比（ball_v1/test, IoU>=0.5）：
+    COCO(c32) F1=0.00 vs 微调(c0) F1=0.869。
+  - 手持真机逐帧采样“画面可检出球 %”：COCO 均值 11.1% → 微调 42.1%（约 3.8x）。
+
+### Phase 3: 导出 ONNX 并用 ball_detector 评测
+- **Status:** complete
+- Actions taken:
+  - 导出 `best.onnx`：固定 640 输入，输出 `1x5x8400` 裸检测（`nms=False, opset=12`），
+    兼容 `engine-py/ball_detector.py` 的 `OnnxDnnBackend`（自做 NMS）。
+  - 修正 `export_ball_onnx.sh`：不能 `nms=True`（会把 NMS 烙进图里，破坏 OnnxDnnBackend）。
+  - 用 ONNX 在 3 条手持视频跑完整 `ball_detector.py` 漏斗：检测数量级下降（
+    28000→707），说明 COCO 基线主要是误检；`tracks_usable` IMG_3 从 282 降至 31。
+- 评测产物：
+  - `training/ball_detector/runs/ball_v1_n/eval_report.json`
+  - `training/ball_detector/runs/ball_v1_n/weights/{best.pt,best.onnx}`
+
 ## Session: 2026-03-22（移动端云服务重构）
 
 ### Phase A: 架构与协议冻结

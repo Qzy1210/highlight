@@ -1,5 +1,29 @@
 # Findings: 移动端云服务重构（2026-03-22）
 
+## 2026-09-23 P0：YOLO 球检测接入 detect_goals（新增）
+- 目标：把微调后的球 ONNX 作为主链路球定位来源（YOLO 优先 + MOG2 兜底），
+  解决手持/移动机位下 MOG2 背景差分失效问题。
+- 关键实现：
+  - `BallDetectorConfig` 从 `cfg["ball_detector"]` 读取，默认 `enabled:false`，旧配置/旧行为完全不变。
+  - `_infer_ball_box_with_onnx` 复用 hoop 的 letterbox + cv2.dnn 自做 NMS 范式；ONNX 固定 640 输入。
+  - 主循环：YOLO 全图命中直接用全局坐标；未命中且 `fallback_to_mog2=true` 时回退 detect_region 内 MOG2。
+  - 候选事件 `ball_conf` 由写死的 0.65 改为 YOLO 真实置信度（MOG2 路径仍为 0.65）。
+  - 新增 `--ball-detect-only` 调试模式，均匀采样输出 `detection_ratio`（等价于“画面可检出球 %”）。
+- 实测命中率（ball-detect-only, ~40 帧采样）：
+  | 视频 | detection_ratio |
+  |------|-----------------|
+  | 582055(高晃) | 19.1% |
+  | 371be0(中晃) | 31.0% |
+  | IMG_3(低晃) | 40.0% |
+  - 注：与之前 ultralytics 逐帧 probe（23.8/47.6/55.0）量级一致但偏低，
+    原因是 `--ball-detect-only` 采样帧数少（40 帧）且为均匀间隔，非逐帧密采样。
+- 回归：582055 `detect_goals_auto` events 2→3（YOLO 优先后多捕获候选）；IMG_3 两模式均 0（无进球）。
+- 已知约束/后续：
+  - Go 端 `cmd/app/main.go` 构造 `pipeline.run.json` 时读 `configs/pipeline.sample.json` 模板，
+    因此只需在模板里加 `ball_detector` 段即可让桌面端任务使用 YOLO 球检测（需置 `enabled:true`）。
+  - 主循环每帧全图 YOLO（imgsz=640）比原 MOG2 慢（IMG_3 1080p 全程约 66s vs 13s，约 5x）；
+    后续可加检测区域裁剪或帧级缓存优化，当前先保证正确性。
+
 ## Requirements
 - 使用 `gin_fram` 风格重构 Go 服务。
 - 前后端分离，提供标准 HTTP 接口，支持云部署与移动端调用。
@@ -174,6 +198,42 @@
   - `single-job/start` 调整为必须携带已确认 `hoop`，并关闭任务阶段二次自动篮框，保证可复现。
 - 当前已知约束：
   - 自动篮框推理依赖 `opencv-python + numpy`；若运行环境缺失会返回失败并走手工兜底。
+
+## 2026-09-23 球检测微调基线（ball_v1_n）结果（新增）
+- 背景：现有进球检测依赖 MOG2 背景差分 + 固定 ROI，对手持/移动机位失效。
+  目标是用「YOLO 微调单类球检测」替代，先建一个可量化基线。
+- 数据：公开数据集 `koppolusameer/basketball-coco-player-detection`（CC BY 4.0，
+  NBA 转播片段，COCO 标注）。用 `scripts/convert_ball_coco_to_yolo.py` 抽取
+  `category_id==1`（ball），转成 YOLO 单类。
+  - 拆分：train 1943 / valid 166 / test 151（含球图）。
+  - 球框极小：576 图中位约 10×17 px（小目标，是召回偏低的主因之一）。
+- 训练：YOLOv8n 微调，`imgsz=640, batch=16, device=mps, epochs=100(patience=30)`。
+  - 实际跑 89 epoch 早停，最佳 epoch 59，耗时 2.81h。
+  - 指标（ultralytics val，test 划分）：P=0.948 R=0.815 mAP50=0.905 mAP50-95=0.538。
+- **关键对比（同数据、同 conf=0.15、IoU>=0.5，ball_v1/test）**：
+  | 模型 | images_with_det | TP | FP | FN | P | R | F1 |
+  |------|-----------------|----|----|----|---|---|----|
+  | COCO 零样本 yolov8n(c32) | 3/151 | 0 | 3 | 151 | 0.00 | 0.00 | **0.00** |
+  | 微调 ball_v1_n(c0) | 134/151 | 129 | 17 | 22 | 0.884 | 0.854 | **0.869** |
+  - 结论：COCO 的 `sports ball` 对本场景几乎完全失效（151 GT 里只 0 个命中）；
+    微调后 F1≈0.87，是数量级的提升。
+- 手持真机视频（逐帧采样，同 imgsz=640，画面能否检出球）：
+  | 视频 | COCO 零样本 | 微调 | 提升 |
+  |------|------------|------|------|
+  | 582055(高晃) | 9.5% | 23.8% | 2.5x |
+  | 371be0(中晃) | 23.8% | 47.6% | 2.0x |
+  | IMG_3(低晃) | 0.0% | 55.0% | ∞ |
+  | 均值 | **11.1%** | **42.1%** | **3.8x** |
+  - 与既有“零样本 COCO 命中率 14-16%”基线一致，微调后抬到约 42%。
+- 部署产物：`training/ball_detector/runs/ball_v1_n/weights/best.onnx`
+  （固定输入 640，输出 `1x5x8400` 裸检测，未内置 NMS，供
+  `engine-py/ball_detector.py` 的 `OnnxDnnBackend` 自做 NMS）。
+- 已知约束/后续：
+  - ONNX 固定 640 输入，`cv2.dnn` 改 imgsz 会触发 DFL Reshape 报错；训练也是
+    640，故推理固定 640。若要 960 推理需重新导出（动态轴/onnxruntime）。
+  - 目前是「转播片段」训练 → 手持/低角度视频存在域差；手持召回仍有提升空间，
+    后续建议用用户自有视频抽帧做增量微调。
+  - 评测产物：`training/ball_detector/runs/ball_v1_n/eval_report.json`。
 
 ## Issues Encountered
 | Issue | Resolution |
