@@ -12,6 +12,7 @@
 
 - 本地选择视频并框选篮框（两次点击：中心 -> 边缘）。
 - 可选启用 `auto_hoop`（ONNX）自动识别篮框并回填 `hoop`。
+- 球检测默认走 YOLO ONNX（`ball_detector`），未命中时回退 MOG2 背景差分。
 - 自动检测进球事件并展示时间轴。
 - 勾选事件后点击 `导出视频` 重导出。
 - 任务进度实时显示：`进度`、`预计剩余`、`已耗时`。
@@ -27,6 +28,7 @@ basketball-mvp/
 ├─ app-go/                 # Go 服务 + 桌面壳 + Web UI
 ├─ engine-py/              # Python 检测引擎
 ├─ configs/                # 配置模板与中文参数说明
+├─ models/                 # 内置检测模型（hoop/ + ball/，随包分发）
 ├─ scripts/                # 运行时准备、校验、打包脚本
 ├─ runtime/                # 可选：内置 Python/FFmpeg 运行时
 ├─ dist/                   # 打包产物

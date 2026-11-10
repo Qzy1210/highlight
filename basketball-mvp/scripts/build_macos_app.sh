@@ -101,10 +101,22 @@ copy_runtime_bundle() {
   fi
 }
 
-copy_auto_hoop_model() {
-  local run_dir="$ROOT_DIR/training/hoop_detector/runs"
-  local dst_dir="$APP_RES_DIR/models/hoop"
+copy_detector_model() {
+  # 拷贝检测模型到 App 内置目录。
+  # 入参：$1=模型类别名（hoop/ball），$2=训练产物 glob 目录。
+  # 优先使用仓库内 models/<kind>/best.onnx（可入库、可复现），
+  # 其次回退到训练目录里最新的 best.onnx。
+  local kind="$1"
+  local run_dir="$2"
+  local embedded="$ROOT_DIR/models/$kind/best.onnx"
+  local dst_dir="$APP_RES_DIR/models/$kind"
   mkdir -p "$dst_dir"
+
+  if [[ -f "$embedded" ]]; then
+    cp "$embedded" "$dst_dir/best.onnx"
+    echo "Bundled $kind model from: $embedded"
+    return
+  fi
 
   local matches=()
   if [[ -d "$run_dir" ]]; then
@@ -114,8 +126,8 @@ copy_auto_hoop_model() {
   fi
 
   if [[ ${#matches[@]} -eq 0 ]]; then
-    echo "WARN: auto hoop model not found under: $run_dir"
-    echo "      expected path pattern: */weights/best.onnx"
+    echo "WARN: $kind model not found at $embedded or under: $run_dir"
+    echo "      expected path pattern: models/$kind/best.onnx or */weights/best.onnx"
     return
   fi
 
@@ -123,9 +135,9 @@ copy_auto_hoop_model() {
   latest="$(ls -1t "${matches[@]}" | head -n 1)"
   if [[ -n "$latest" && -f "$latest" ]]; then
     cp "$latest" "$dst_dir/best.onnx"
-    echo "Bundled auto hoop model from: $latest"
+    echo "Bundled $kind model from: $latest"
   else
-    echo "WARN: auto hoop model candidate invalid: $latest"
+    echo "WARN: $kind model candidate invalid: $latest"
   fi
 }
 
@@ -148,7 +160,8 @@ fi
 cp -R "$ROOT_DIR/engine-py" "$APP_RES_DIR/"
 cp -R "$ROOT_DIR/configs" "$APP_RES_DIR/"
 cp -R "$ROOT_DIR/app-go/web" "$APP_RES_DIR/app-go/"
-copy_auto_hoop_model
+copy_detector_model "hoop" "$ROOT_DIR/training/hoop_detector/runs"
+copy_detector_model "ball" "$ROOT_DIR/training/ball_detector/runs"
 chmod +x "$APP_MACOS_DIR/BasketballMVP" "$APP_MACOS_DIR/basketball_mvp_server"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" <<PLIST

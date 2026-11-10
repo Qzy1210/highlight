@@ -1,5 +1,67 @@
 # Progress Log
 
+## Session: 2026-10-29（球检测默认启用 + 模型入库 + 端到端验证）
+
+### 目标
+上一轮训练的 YOLO 球检测模型虽已接入代码，但 `ball_detector.enabled=false`，
+桌面端实际仍走纯 MOG2。本轮把模型真正接入默认链路并做端到端验证。
+
+### 变更
+- 新增 `models/ball/best.onnx`（来自 `training/ball_detector/runs/ball_v1_n/weights/best.onnx`）。
+- 新增 `models/hoop/best.onnx`（此前只存在于 `dist/` 打包产物中，源码树缺失，
+  导致源码运行时 `auto hoop model not found`）。
+  - `models/` 不在 `.gitignore` 中，两个模型现已可入库、可复现。
+- `configs/pipeline.sample.json`：`ball_detector.enabled` 由 `false` 改为 `true`。
+- `scripts/build_macos_app.sh`：`copy_auto_hoop_model` 泛化为 `copy_detector_model`，
+  优先取 `models/<kind>/best.onnx`，其次回退训练目录，hoop 与 ball 各拷一份。
+- `scripts/build_windows_app.ps1`：此前**完全没有拷贝任何模型**，现补齐 hoop/ball 拷贝。
+- `configs/CONFIG.zh-CN.md`：补充 `ball_detector` 参数说明。
+- `README.md`：功能总览与项目结构补充 YOLO 球检测与 `models/` 目录。
+
+### 验证（macOS arm64，venv Python 3.13 + cv2 4.13）
+- `go build ./...` 通过；`python3 -m py_compile engine-py/detect_goals.py` 通过。
+- `bash -n scripts/build_macos_app.sh` 通过；实跑打包成功，
+  两个模型均出现在 `.app/Contents/Resources/project/models/{hoop,ball}/best.onnx`。
+- 模型自动发现：
+  - `_discover_default_ball_model()` → `models/ball/best.onnx`
+  - `_discover_default_auto_hoop_model()` → `models/hoop/best.onnx`
+- 自动篮框检测（此前源码环境直接 400）：`POST /api/v1/hoop/detect` 返回
+  `status=multiple`，真篮框候选 `cx=863 cy=321 r=35 score=0.461` 排第一。
+  但 4 条视频实测质量不稳：371be0 全部误检、1165 完全漏检，仍需人工确认。
+- 端到端单任务（IMG_3，hoop=863/321/35）：
+  - `POST /api/v1/single-job/start` → 产出 `goals.json` + `highlight.mp4`（6.3MB）。
+  - `goals.json` 中 `ball_detector.status=ok`、`model_path` 指向 `models/ball/best.onnx`。
+  - 事件 3 个：65.67s / 80.80s / 102.13s。
+
+### 关键实测结论（MOG2 vs YOLO）
+
+人工逐帧核对（放大到篮框区域，逐 0.1~0.2s 取帧）建立 IMG_3 真值：
+真实进球 5 个 —— 65.7 / 80.9 / 92.15 / 102.15 / 113.2 秒。
+真值已落盘：`workspace/truth/IMG_3.truth.json`。
+
+| 模式 | 检出 | TP | FP | FN | 精确率 | 召回率 | F1 | 耗时 |
+|------|------|----|----|----|--------|--------|----|------|
+| 纯 MOG2 | 3 | 3 | 0 | 2 | 1.00 | 0.60 | 0.75 | 14.9s |
+| YOLO + MOG2 兜底 | 3 | 3 | 0 | 2 | 1.00 | 0.60 | 0.75 | 103.9s |
+| 纯 YOLO（不回退） | 1 | 1 | 0 | 4 | 1.00 | 0.20 | 0.33 | 116.8s |
+
+- 三种模式在这条视频上**都没有误报**，短板是**漏检**，不是误报。
+  （上一版记录里“另 2 个是 MOG2 误报”的结论是错的，已更正。）
+- 纯 YOLO 把召回从 0.60 拉到 0.20，因此 `fallback_to_mog2` **必须保持 true**。
+- 两种模式各漏 2 个，且漏的不是同一批：
+  - 纯 MOG2 漏 92.15 / 102.15；
+  - YOLO+MOG2 漏 92.15 / 113.2。
+- 92.15 秒两种模式都漏。逐帧查 YOLO 推理输出可见：球在 91.47s 于框上方被检出，
+  下一次检出已在 92.13s 的框下方（y=374），**穿框瞬间完全没有检出**（遮挡/运动模糊），
+  轨迹里缺了框内那几帧，因此不满足“连续下行穿框”条件。
+  这是当前召回瓶颈的直接原因：靠“逐帧必须检到框内点”判定，中间断一帧就漏。
+- 代价：YOLO 全图逐帧推理使 1080p 视频耗时约 7x（14.9s → 103.9s）。
+
+### 待办（本轮未做）
+- 召回优化优先于切换检测器：允许轨迹在框内短暂断检（跨帧插值）后再判穿框。
+- 扩评测集：当前只有 IMG_3 一条真值，结论不足以支撑阈值调参。
+- 篮框自动检测准确率不足（漏检 + 多项误检），维持“候选 + 人工确认”定位。
+
 ## Session: 2026-09-23（P0：YOLO 球检测接入 detect_goals 主链路）
 
 ### Phase P0: YOLO 球检测优先 + MOG2 兜底

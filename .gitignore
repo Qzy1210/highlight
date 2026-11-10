@@ -32,3 +32,8 @@ script
 *.MOV
 *.mov
 *.pt
+
+# Local tool artifacts / training runs
+.codegraph/
+runs/
+basketball-mvp/runs/

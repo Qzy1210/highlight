@@ -1,0 +1,88 @@
+{
+  "generated_at": "2026-11-10",
+  "video": "IMG_3.MOV",
+  "resolution": "1920x1080",
+  "fps": 30,
+  "duration_sec": 120,
+  "hoop": {
+    "cx": 863,
+    "cy": 321,
+    "r": 35
+  },
+  "truth_events_sec": [
+    65.7,
+    80.9,
+    92.15,
+    102.15,
+    113.2
+  ],
+  "tolerance_sec": 1.0,
+  "results": [
+    {
+      "mode": "off",
+      "label": "纯 MOG2",
+      "detected": [
+        65.73,
+        80.93,
+        113.27
+      ],
+      "tp": 3,
+      "fp": 0,
+      "fn": 2,
+      "precision": 1.0,
+      "recall": 0.6,
+      "f1": 0.75,
+      "missed": [
+        92.15,
+        102.15
+      ],
+      "false_positives": []
+    },
+    {
+      "mode": "on",
+      "label": "YOLO + MOG2 兜底",
+      "detected": [
+        65.67,
+        80.8,
+        102.13
+      ],
+      "tp": 3,
+      "fp": 0,
+      "fn": 2,
+      "precision": 1.0,
+      "recall": 0.6,
+      "f1": 0.75,
+      "missed": [
+        92.15,
+        113.2
+      ],
+      "false_positives": []
+    },
+    {
+      "mode": "yoloonly",
+      "label": "纯 YOLO（不回退）",
+      "detected": [
+        102.13
+      ],
+      "tp": 1,
+      "fp": 0,
+      "fn": 4,
+      "precision": 1.0,
+      "recall": 0.2,
+      "f1": 0.333,
+      "missed": [
+        65.7,
+        80.9,
+        92.15,
+        113.2
+      ],
+      "false_positives": []
+    }
+  ],
+  "notes": [
+    "三种模式在该视频上均无误报，短板为漏检。",
+    "纯 YOLO 召回 0.20，显著低于 MOG2 的 0.60，故 fallback_to_mog2 应保持 true。",
+    "92.15s 两种模式均漏检：球穿框瞬间无检测（遮挡/运动模糊），轨迹缺失框内帧。",
+    "仅单条视频真值，结论仅作方向参考，不足以支撑阈值调参。"
+  ]
+}

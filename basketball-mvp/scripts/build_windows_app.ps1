@@ -26,8 +26,32 @@ Copy-Item -Recurse -Force (Join-Path $Root 'configs') (Join-Path $ResProject 'co
 New-Item -ItemType Directory -Force -Path (Join-Path $ResProject 'app-go') | Out-Null
 Copy-Item -Recurse -Force (Join-Path $Root 'app-go/web') (Join-Path $ResProject 'app-go/web')
 
-$runtimeSrc = Join-Path $Root ("runtime/windows-" + $Arch)
-$runtimeDst = Join-Path $ResProject 'runtime'
+# 拷贝检测模型：优先仓库内 models/<kind>/best.onnx，其次训练目录最新 best.onnx。
+foreach ($kind in @('hoop','ball')) {
+  $dstDir = Join-Path $ResProject ("models/" + $kind)
+  New-Item -ItemType Directory -Force -Path $dstDir | Out-Null
+  $embedded = Join-Path $Root ("models/" + $kind + "/best.onnx")
+  if (Test-Path $embedded) {
+    Copy-Item -Force $embedded (Join-Path $dstDir 'best.onnx')
+    Write-Host "Bundled $kind model from: $embedded"
+    continue
+  }
+  $runDir = Join-Path $Root ("training/" + $kind + "_detector/runs")
+  $found = @()
+  if (Test-Path $runDir) {
+    $found = Get-ChildItem -Path $runDir -Recurse -Filter 'best.onnx' -File |
+      Where-Object { $_.DirectoryName -like '*weights*' }
+  }
+  if ($found.Count -eq 0) {
+    Write-Warning "$kind model not found at $embedded or under: $runDir"
+    continue
+  }
+  $latest = $found | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+  Copy-Item -Force $latest.FullName (Join-Path $dstDir 'best.onnx')
+  Write-Host "Bundled $kind model from: $($latest.FullName)"
+}
+
+$runtimeSrc = Join-Path $Root ("runtime/windows-" + $Arch)$runtimeDst = Join-Path $ResProject 'runtime'
 if (Test-Path $runtimeSrc) {
   New-Item -ItemType Directory -Force -Path $runtimeDst | Out-Null
   Copy-Item -Recurse -Force (Join-Path $runtimeSrc '*') $runtimeDst

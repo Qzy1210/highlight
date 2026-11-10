@@ -44,6 +44,27 @@
   - 自动篮框失败时，是否回退到已有 `hoop` 参数继续跑检测。
   - 建议默认 `true`，避免任务直接失败。
 
+## ball_detector（YOLO 球检测，可开关）
+
+- `enabled`
+  - 是否启用 YOLO ONNX 球检测。默认 `true`（2026-10-29 起）。
+  - 启用后球定位优先走 YOLO 全图检测，对手持/移动机位更鲁棒。
+- `model_path`
+  - ONNX 模型路径。
+  - 留空时自动查找 `models/ball/best.onnx`，再回退到
+    `training/ball_detector/runs/*/weights/best.onnx` 中最新的一个。
+- `input_size`
+  - 推理输入尺寸，必须与导出时一致（当前模型固定 `640`）。
+  - 注意：`cv2.dnn` 后端改尺寸会触发 DFL Reshape 报错，不要随意改。
+- `conf_threshold`
+  - 球检测置信度阈值。实测 `0.15` 可较好平衡手持视频召回。
+- `iou_threshold`
+  - NMS 去重阈值。
+- `fallback_to_mog2`
+  - YOLO 未检出时是否回退到 MOG2 背景差分。
+  - `true`：召回更高，但会把 MOG2 的误报一并带进来。
+  - `false`：只用 YOLO，误报明显更少（实测 IMG_3 由 3 个事件降到 1 个）。
+
 ## detect（自动检测参数）
 
 - `frame_skip`

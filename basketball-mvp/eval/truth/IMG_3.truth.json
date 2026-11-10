@@ -1,0 +1,49 @@
+{
+  "video": "IMG_3.MOV",
+  "frame_size": {
+    "width": 1920,
+    "height": 1080
+  },
+  "hoop": {
+    "cx": 863,
+    "cy": 321,
+    "r": 35
+  },
+  "annotated_by": "visual frame-by-frame check (2026-10-29)",
+  "events": [
+    {
+      "time_sec": 65.7,
+      "note": "球从框上方落入篮网，真实进球"
+    },
+    {
+      "time_sec": 80.9,
+      "note": "球入网，真实进球"
+    },
+    {
+      "time_sec": 92.15,
+      "note": "球入网，真实进球（两种模式均漏检）"
+    },
+    {
+      "time_sec": 102.15,
+      "note": "球入网，真实进球"
+    },
+    {
+      "time_sec": 113.2,
+      "note": "球入网，真实进球"
+    }
+  ],
+  "non_goals": [
+    {
+      "time_sec": 17.7,
+      "note": "球从框右侧穿过，未入网"
+    },
+    {
+      "time_sec": 21.6,
+      "note": "仅篮网晃动，无球"
+    },
+    {
+      "time_sec": 37.1,
+      "note": "球在网下方出现，无法确认穿框"
+    }
+  ]
+}

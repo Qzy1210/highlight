@@ -16,7 +16,7 @@
     "fallback_to_manual": true
   },
   "ball_detector": {
-    "enabled": false,
+    "enabled": true,
     "model_path": "",
     "input_size": 640,
     "conf_threshold": 0.15,
